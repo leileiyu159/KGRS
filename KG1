@@ -1,0 +1,300 @@
+import pandas as pd
+import networkx as nx
+import json
+import numpy as np
+
+# --------------------------------------------------------
+# 辅助函数: 安全地解析JSON字符串
+# --------------------------------------------------------
+
+def safe_json_load(json_str, key='name'):
+    """
+    安全地将CSV中的JSON字符串解析为实体名称列表。
+    例如: '[{"id": 28, "name": "Action"}]' -> ['Action']
+    """
+    if pd.isna(json_str) or json_str == '[]':
+        return []
+    try:
+        # TMDB数据集中的JSON字符串可能包含单引号或未转义的双引号，尝试进行清理
+        data = json.loads(json_str.replace("'", "\""))
+        return [item[key] for item in data if key in item]
+    except json.JSONDecodeError:
+        # 如果第一次解析失败，可能是非标准格式，尝试更宽松的清理
+        cleaned_str = json_str.replace("'", "\"").replace('\\"', '"')
+        try:
+            data = json.loads(cleaned_str)
+            return [item[key] for item in data if key in item]
+        except:
+            # 如果解析最终失败，返回空列表
+            return []
+
+# 定义通用的读取函数，处理编码问题
+def read_csv_safe(file_path):
+    """尝试以 UTF-8 或 Latin-1 编码读取 CSV 文件。"""
+    try:
+        return pd.read_csv(file_path, encoding='utf-8')
+    except UnicodeDecodeError:
+        print(f"   尝试使用 latin-1 编码读取 {file_path}...")
+        return pd.read_csv(file_path, encoding='latin-1')
+
+
+# --------------------------------------------------------
+# 核心类: 知识图谱推荐器 (KGRecommender)
+# --------------------------------------------------------
+
+class KGRecommender:
+    """
+    基于知识图谱 (NetworkX) 的电影推荐器类。
+    在初始化时加载数据并构建图谱。
+    """
+
+    def __init__(self, movies_file_path, credits_file_path):
+        self.movies_file_path = movies_file_path
+        self.credits_file_path = credits_file_path
+        self.G = None  # 知识图谱对象
+        self._initialize_graph()
+
+    def _load_and_merge_data(self):
+        """读取 movies 和 credits 文件，并根据电影ID进行合并。"""
+        print(f"-> 正在读取电影元数据: {self.movies_file_path}...")
+
+        movies_df = read_csv_safe(self.movies_file_path)
+        credits_df = read_csv_safe(self.credits_file_path)
+
+        if 'title' in movies_df.columns and 'original_title' in movies_df.columns:
+            movies_df = movies_df.drop(columns=['title'])
+            print("-> 警告: 电影文件中存在 'title' 列，已删除以避免与 'original_title' 冲突。")
+
+        movies_df['id'] = movies_df['id'].astype(str)
+        credits_df['movie_id'] = credits_df['movie_id'].astype(str)
+        credits_df = credits_df.rename(columns={'movie_id': 'id'})
+
+        print("-> 正在根据 'id' 合并数据...")
+        df = pd.merge(movies_df, credits_df, on='id', how='inner')
+
+        if 'title_y' in df.columns:
+            df = df.drop(columns=['title_y'])
+
+        required_cols = ['id', 'original_title', 'genres', 'cast', 'crew']
+        if not all(col in df.columns for col in required_cols):
+            missing = [col for col in required_cols if col not in df.columns]
+            print(f"-> 致命错误: 合并后的数据仍缺少关键列: {missing}")
+            return pd.DataFrame()
+
+        df = df.dropna(subset=required_cols).reset_index(drop=True)
+        df['id'] = df['id'].astype(str)
+
+        print(f"-> 数据合并完成。总记录数: {len(df)}")
+        return df
+
+    def _preprocess_data(self, df):
+        """解析合并后的 DataFrame 中的 JSON 列，提取实体。"""
+        print("-> 正在解析电影类型 (Genres)...")
+        df['parsed_genres'] = df['genres'].apply(lambda x: safe_json_load(x, 'name'))
+
+        print("-> 正在解析主要演员 (Cast)...")
+        df['parsed_actors'] = df['cast'].apply(lambda x: safe_json_load(x, 'name')[:5])
+
+        print("-> 正在解析导演 (Director)...")
+
+        def extract_director(crew_json):
+            if pd.isna(crew_json): return None
+            try:
+                crew_list = json.loads(crew_json.replace("'", "\""))
+                for member in crew_list:
+                    if member.get('job') == 'Director':
+                        return member.get('name')
+            except:
+                return None
+            return None
+
+        df['director'] = df['crew'].apply(extract_director)
+
+        df = df.dropna(subset=['director'])
+
+        print(f"-> 预处理完成。剩余可用电影记录数: {len(df)}")
+        return df[['id', 'original_title', 'director', 'parsed_actors', 'parsed_genres']]
+
+    def _build_knowledge_graph(self, df):
+        """根据解析后的DataFrame构建知识图谱 (NetworkX Graph)。"""
+        print("-> 正在构建知识图谱...")
+        G = nx.MultiDiGraph()
+
+        for _, row in df.iterrows():
+            movie_id = row['id']
+            movie_name = row['original_title']
+
+            # 1. 添加电影节点
+            G.add_node(movie_id, name=movie_name, type='Movie')
+
+            # 2. 添加导演关系 (DIRECTED_BY)
+            director = row['director']
+            if director:
+                G.add_node(director, type='Director')
+                G.add_edge(movie_id, director, relation='DIRECTED_BY')
+
+            # 3. 添加演员关系 (STARRING)
+            for actor in row['parsed_actors']:
+                G.add_node(actor, type='Actor')
+                G.add_edge(movie_id, actor, relation='STARRING')
+
+            # 4. 添加类型关系 (BELONGS_TO)
+            for genre in row['parsed_genres']:
+                G.add_node(genre, type='Genre')
+                G.add_edge(movie_id, genre, relation='BELONGS_TO')
+
+        print(f"-> 图谱构建完成！总节点数: {len(G.nodes)}, 总边数: {len(G.edges)}")
+        return G
+
+    def _initialize_graph(self):
+        """初始化图谱：加载、预处理、构建。"""
+        df_merged = self._load_and_merge_data()
+        if df_merged.empty:
+            print("\n无法初始化：数据加载或合并失败。")
+            return
+        df_final = self._preprocess_data(df_merged)
+        self.G = self._build_knowledge_graph(df_final)
+
+        # 打印示例标题供用户测试
+        sample_movies = df_final['original_title'].head(10).tolist()
+        print("\n-> 调试/提示: 图谱中前10个可用于测试的电影标题:")
+        for title in sample_movies:
+            print(f"   - {title}")
+        print("-------------------------------------------------------------------------")
+
+    def recommend(self, seed_movie_title, top_k=5):
+        """
+        [推荐接口方法] 根据种子电影名称，推荐相似电影。
+
+        参数:
+        - seed_movie_title (str): 用于生成推荐的种子电影名称。
+        - top_k (int): 返回的推荐结果数量。
+
+        返回:
+        - list: 包含推荐电影名称、得分和原因的字典列表。
+        """
+        if not self.G:
+            return [{'Error': '图谱未成功初始化，无法推荐。'}]
+
+        print(f"\n-> 基于种子电影 '{seed_movie_title}' 执行推荐...")
+
+        G = self.G
+        target_title_lower = seed_movie_title.lower().strip()
+
+        # 1. 找到种子电影的ID (使用健壮匹配)
+        seed_movie_nodes = [
+            n for n, data in G.nodes(data=True)
+            if data.get('type') == 'Movie' and
+               str(data.get('name', '')).lower().strip() == target_title_lower
+        ]
+
+        if not seed_movie_nodes:
+            first_movie_in_graph = next(
+                (data.get('name') for n, data in G.nodes(data=True) if data.get('type') == 'Movie'), 'N/A')
+            print(f"错误: 图谱中找不到电影 '{seed_movie_title}'。第一个电影是 '{first_movie_in_graph}'。请检查名称。")
+            return []
+
+        seed_movie_id = seed_movie_nodes[0]
+        print(f"-> 已找到种子电影ID: {seed_movie_id}")
+
+        # 2. 找到种子电影关联的所有实体 (导演、演员、类型)
+        shared_entities = {'Director': set(), 'Actor': set(), 'Genre': set()}
+        for target_id, data in G[seed_movie_id].items():
+            for key in data:
+                edge = data[key]
+                entity_type = G.nodes[target_id].get('type')
+                if entity_type == 'Director' and edge.get('relation') == 'DIRECTED_BY':
+                    shared_entities['Director'].add(target_id)
+                elif entity_type == 'Actor' and edge.get('relation') == 'STARRING':
+                    shared_entities['Actor'].add(target_id)
+                elif entity_type == 'Genre' and edge.get('relation') == 'BELONGS_TO':
+                    shared_entities['Genre'].add(target_id)
+
+        if not any(shared_entities.values()):
+            print("种子电影没有关联的实体，无法推荐。")
+            return []
+
+        # 3. 寻找与这些实体关联的其他电影，并计算相似度得分
+        recommendations = {}
+        for entity_type, entities in shared_entities.items():
+            for entity in entities:
+                for movie_id in G.predecessors(entity):
+                    if movie_id == seed_movie_id:
+                        continue
+
+                    # 验证关系是否匹配
+                    edge_data = G.get_edge_data(movie_id, entity)
+                    required_relation = {'Director': 'DIRECTED_BY', 'Actor': 'STARRING', 'Genre': 'BELONGS_TO'}.get(
+                        entity_type)
+
+                    if edge_data and edge_data[0].get('relation') == required_relation:
+                        score_increase = 1.5 if entity_type == 'Director' else 1.0
+                        reason = f"共享{entity_type}: {entity}"
+
+                        if movie_id not in recommendations:
+                            recommendations[movie_id] = {'score': 0, 'reasons': []}
+
+                        recommendations[movie_id]['score'] += score_increase
+                        if reason not in recommendations[movie_id]['reasons']:
+                            recommendations[movie_id]['reasons'].append(reason)
+
+        # 4. 排序并返回结果
+        sorted_recs = sorted(recommendations.items(), key=lambda item: item[1]['score'], reverse=True)
+
+        final_recs = []
+        for movie_id, data in sorted_recs[:top_k]:
+            final_recs.append({
+                'MovieName': G.nodes[movie_id].get('name', 'N/A'),
+                'Score': round(data['score'], 2),
+                'Reasons': data['reasons']
+            })
+
+        return final_recs
+
+
+# --------------------------------------------------------
+# 步骤 4: 运行程序 (API 模拟调用示例)
+# --------------------------------------------------------
+
+if __name__ == "__main__":
+
+    # 文件路径
+    MOVIES_FILE = 'tmdb_5000_movies.csv'
+    CREDITS_FILE = 'tmdb_5000_credits.csv'
+
+    # 定义种子电影
+    SEED_MOVIE = "Pirates of the Caribbean: At World's End"
+
+    # A. 初始化推荐器 (模拟服务启动时的图谱构建，只执行一次)
+    print("\n--- 1. 初始化推荐服务 (构建知识图谱) ---")
+    recommender = KGRecommender(MOVIES_FILE, CREDITS_FILE)
+
+    # B. 调用推荐接口 (模拟用户查询)
+    print("\n--- 2. 调用推荐接口 (查询: 'Pirates of the Caribbean: At World's End') ---")
+    recommendations = recommender.recommend(SEED_MOVIE, top_k=5)
+
+    # C. 输出结果
+    print("\n--- 推荐结果 ---")
+    if recommendations and 'Error' not in recommendations[0]:
+        print(f"基于您对 '{SEED_MOVIE}' 的偏好，为您推荐以下电影:")
+        for i, rec in enumerate(recommendations, 1):
+            reason_str = "; ".join(rec['Reasons'])
+            print(f"{i}. 电影: {rec['MovieName']} (相似度得分: {rec['Score']})")
+            print(f"   原因: {reason_str}")
+    else:
+        print(f"未找到与 '{SEED_MOVIE}' 相关的推荐。")
+
+    # D. 模拟第二次调用 (无需重新初始化，图谱已在内存中)
+    SECOND_SEED_MOVIE = 'Spider-Man 3'  # 使用一个可用的示例电影
+    print(f"\n--- 3. 调用推荐接口 (查询: '{SECOND_SEED_MOVIE}') ---")
+    recommendations_2 = recommender.recommend(SECOND_SEED_MOVIE, top_k=3)
+
+    print("\n--- 第二次推荐结果 ---")
+    if recommendations_2 and 'Error' not in recommendations_2[0]:
+        print(f"基于您对 '{SECOND_SEED_MOVIE}' 的偏好，为您推荐以下电影:")
+        for i, rec in enumerate(recommendations_2, 1):
+            reason_str = "; ".join(rec['Reasons'])
+            print(f"{i}. 电影: {rec['MovieName']} (相似度得分: {rec['Score']})")
+            print(f"   原因: {reason_str}")
+    else:
+        print(f"未找到与 '{SECOND_SEED_MOVIE}' 相关的推荐。")
